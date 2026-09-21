@@ -33,6 +33,11 @@
  * Author: Daniel Hope <daniel.hope@smartalock.com>
  */
 
+//FIXED added include due to Serial.printf(
+// #include <Arduino.h>
+// #include <stdio.h>
+
+
 #include "wireguardif.h"
 
 #include <string.h>
@@ -48,7 +53,23 @@
 #include "wireguard.h"
 #include "crypto.h"
 #include "esp_log.h"
-#include "esp_netif.h"
+
+//FIXED
+/* IDF >= 4.1 removed tcpip_adapter in favour of esp_netif.
+ * Detect which API to use at compile-time based on esp_idf_version.h
+ * (available from IDF 4.0). IDF < 4.0 falls through to tcpip_adapter. */
+#if __has_include("esp_idf_version.h")
+#  include "esp_idf_version.h"
+#  if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 1, 0)
+#    define WIREGUARD_USE_ESP_NETIF
+#  endif
+#endif
+
+#ifdef WIREGUARD_USE_ESP_NETIF
+#  include "esp_netif.h"
+#else
+#  include "tcpip_adapter.h"
+#endif
 
 #include "esp32-hal-log.h"
 
@@ -100,7 +121,27 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
 	struct wireguard_device *device = (struct wireguard_device *)netif->state;
 	// Send to last know port, not the connect port
 	// TODO: Support DSCP and ECN - lwip requires this set on PCB globally, not per packet
-	return udp_sendto_if(device->udp_pcb, q, &peer->ip, peer->port, device->underlying_netif);
+
+	//FIXED
+	log_i(TAG 
+          "\n WG UDP OUT -> %d.%d.%d.%d:%d via %c%c, len=%d \n",
+          ip4_addr1(&peer->ip.u_addr.ip4),
+          ip4_addr2(&peer->ip.u_addr.ip4),
+          ip4_addr3(&peer->ip.u_addr.ip4),
+          ip4_addr4(&peer->ip.u_addr.ip4),
+          peer->port,
+          device->underlying_netif->name[0],
+          device->underlying_netif->name[1],
+          q->tot_len);
+
+	err_t err = udp_sendto_if(device->udp_pcb,
+                              q,
+                              &peer->ip,
+                              peer->port,
+                              device->underlying_netif);
+
+	log_i(TAG, "WG UDP OUT result=%d", err);
+	return err;
 }
 
 static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip_addr_t *ipaddr, u16_t port)
@@ -177,8 +218,30 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 					pbuf_copy_partial(q, dst, unpadded_len, 0);
 				}
 
+				//FIXED 				
+				log_d(TAG 
+					"\nWG TX BEFORE ENC: "
+					"keypair=%p valid=%d initiator=%d "
+					"local=%08x remote=%08x counter=%llu "
+					"send_valid=%d recv_valid=%d\n",
+					keypair,
+					keypair->valid,
+					keypair->initiator,
+					keypair->local_index,
+					keypair->remote_index,
+					keypair->sending_counter,
+					keypair->sending_valid,
+					keypair->receiving_valid
+				);
+
 				// Then encrypt
 				wireguard_encrypt_packet(dst, dst, padded_len, keypair);
+
+				//FIXED				
+				// printf("WG TX ENC: ");
+				// for (int i = 0; i < 32; i++)
+				// 	printf("%02X", dst[i]);
+				// printf("\n");
 
 				result = wireguardif_peer_output(netif, pbuf, peer);
 
@@ -226,6 +289,15 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 // The ipaddr here is the one inside the VPN which we use to lookup the correct peer/endpoint
 static err_t wireguardif_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ip4addr)
 {
+	log_i(TAG,
+      		"WG OUTPUT: dst=%d.%d.%d.%d netif=%c%c \n",
+      		ip4_addr1(ip4addr),
+      		ip4_addr2(ip4addr),
+      		ip4_addr3(ip4addr),
+      		ip4_addr4(ip4addr),
+      		netif->name[0],
+      		netif->name[1]);
+
 	struct wireguard_device *device = (struct wireguard_device *)netif->state;
 	// Send to peer that matches dest IP
 	ip_addr_t ipaddr;
@@ -319,6 +391,12 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 	uint32_t idx = data_hdr->receiver;
 
 	keypair = get_peer_keypair_for_idx(peer, idx);
+	
+	//FIXED
+	log_d(TAG "WG RX DATA: receiver=%08x counter=%llu keypair=%p\n",
+		idx,
+		nonce,
+		keypair);
 
 	if (keypair)
 	{
@@ -342,6 +420,8 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 				memset(pbuf->payload, 0, pbuf->tot_len);
 				if (wireguard_decrypt_packet(pbuf->payload, src, src_len, nonce, keypair))
 				{
+					//FIXED
+					log_d(TAG "WG RX DECRYPT: SUCCESS\n");
 
 					// 3. Since the packet has authenticated correctly, the source IP of the outer UDP/IP packet is used to update the endpoint for peer TrMv...WXX0.
 					// Update the peer location
@@ -425,6 +505,10 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					{
 						// This was a keep-alive packet
 					}
+				}
+				else
+				{
+					log_d(TAG "WG RX DECRYPT: FAIL\n");
 				}
 
 				if (pbuf)
@@ -1046,6 +1130,14 @@ static void wireguardif_tmr(void *arg)
 		peer = &device->peers[x];
 		if (peer->valid)
 		{
+			//FIXED wireguardif_tmr, comented to decrease outputs
+			// log_d(TAG 
+			//           "TIMER peer=%d active=%d key=%d send_hs=%d \n",
+			//           x,
+			//           peer->active,
+			//           peer->curr_keypair.valid,
+			//           peer->send_handshake);
+
 			// Do we need to rekey / send a handshake?
 			if (should_reset_peer(peer))
 			{
@@ -1115,9 +1207,25 @@ err_t wireguardif_init(struct netif *netif)
 	struct udp_pcb *udp;
 	uint8_t private_key[WIREGUARD_PRIVATE_KEY_LEN];
 	size_t private_key_len = sizeof(private_key);
+        
+#ifdef WIREGUARD_USE_ESP_NETIF
+	struct netif *underlying_netif = NULL;
+	{
+		char lwip_netif_name[8] = {0};
+		esp_netif_t *esp_sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+		if (esp_sta) {
+			esp_netif_get_netif_impl_name(esp_sta, lwip_netif_name);
+			underlying_netif = netif_find(lwip_netif_name);
+		}
+		if (underlying_netif == NULL) {
+			log_e(TAG "failed to find underlying netif (WIFI_STA_DEF)");
+		}
+	}
+#else
+	struct netif *underlying_netif = NULL;
+	tcpip_adapter_get_netif(TCPIP_ADAPTER_IF_STA, (void **)&underlying_netif);
+#endif
 
-	struct netif *underlying_netif;
-	underlying_netif = netif_default;
 	log_i(TAG "underlying_netif = %p", underlying_netif);
 
 	LWIP_ASSERT("netif != NULL", (netif != NULL));
@@ -1125,6 +1233,7 @@ err_t wireguardif_init(struct netif *netif)
 
 	// We need to initialise the wireguard module
 	wireguard_init();
+
 	log_i(TAG "wireguard module initialized.");
 
 	if (netif && netif->state)

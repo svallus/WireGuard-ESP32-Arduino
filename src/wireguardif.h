@@ -42,7 +42,10 @@
 #include "lwip/ip_addr.h"
 
 // Default MTU for WireGuard is 1420 bytes
-#define WIREGUARDIF_MTU (1420)
+//#define WIREGUARDIF_MTU (1420)
+//FIXED decrease WIREGUARDIF_MTU to 1280, to place it to UDP packet (max 1500) whit head for UDP a IP
+#define WIREGUARDIF_MTU (1280)
+
 
 #define WIREGUARDIF_DEFAULT_PORT		(51820)
 #define WIREGUARDIF_KEEPALIVE_DEFAULT	(0xFFFF)

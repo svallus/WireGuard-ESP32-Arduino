@@ -21,7 +21,7 @@ extern "C" {
 
 #define TAG "[WireGuard] "
 
-bool WireGuard::begin(const IPAddress& localIP, const IPAddress& Subnet, const IPAddress& Gateway, const char* privateKey, const char* remotePeerAddress, const char* remotePeerPublicKey, uint16_t remotePeerPort, uint16_t listenPort, const char* presharedKey) {
+bool WireGuard::begin(const IPAddress& localIP, const IPAddress& Subnet, const IPAddress& Gateway, const char* privateKey, const char* remotePeerAddress, const char* remotePeerPublicKey, uint16_t remotePeerPort, const IPAddress& allowedIP, const IPAddress& allowedMask, const IPAddress& peerEndpointIP, uint16_t listenPort, const char* presharedKey) {
     // Tear down any existing tunnel before re-initialising.
     if (_is_initialized) end();
 
@@ -44,46 +44,73 @@ bool WireGuard::begin(const IPAddress& localIP, const IPAddress& Subnet, const I
     // Initialise the first WireGuard peer structure
     wireguardif_peer_init(&peer);
 
-    // DNS lookup with exponential back-off.
-    uint32_t retry_delay_ms = 500;
+    // If we know the endpoint's address can add here
+    bool success_get_endpoint_ip;
 
-    bool success_get_endpoint_ip = false;
-
-    for (uint8_t retry = 0; retry < 5; retry++) {
-        ip_addr_t endpoint_ip = IPADDR4_INIT_BYTES(0, 0, 0, 0);
-        struct addrinfo* res = NULL;
-        struct addrinfo hint;
-        memset(&hint, 0, sizeof(hint));
-        memset(&endpoint_ip, 0, sizeof(endpoint_ip));
-
-        if (lwip_getaddrinfo(remotePeerAddress, NULL, &hint, &res) != 0) {
-            log_w(TAG "DNS lookup failed for '%s' (attempt %d/5), retrying in %u ms...",
-                  remotePeerAddress, retry + 1, retry_delay_ms);
-            vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
-            retry_delay_ms = (retry_delay_ms < 8000u) ? retry_delay_ms * 2u : 8000u;
-            continue;
-        }
-
+    if (peerEndpointIP != IPAddress(0, 0, 0, 0))
+    {
+        peer.endpoint_ip = IPADDR4_INIT(static_cast<uint32_t>(peerEndpointIP));
+        log_i(TAG "peer.endpoint_ip is %3d.%3d.%3d.%3d", (peer.endpoint_ip.u_addr.ip4.addr >> 0) & 0xff, (peer.endpoint_ip.u_addr.ip4.addr >> 8) & 0xff, (peer.endpoint_ip.u_addr.ip4.addr >> 16) & 0xff, (peer.endpoint_ip.u_addr.ip4.addr >> 24) & 0xff);
         success_get_endpoint_ip = true;
-        struct in_addr addr4 = ((struct sockaddr_in*)(res->ai_addr))->sin_addr;
-        inet_addr_to_ip4addr(ip_2_ip4(&endpoint_ip), &addr4);
-        lwip_freeaddrinfo(res);
+    }
+    else
+    {
+        // DNS lookup with exponential back-off.
+        uint32_t retry_delay_ms = 500;
 
-        peer.endpoint_ip = endpoint_ip;
-        log_i(TAG "%s is %3d.%3d.%3d.%3d", remotePeerAddress,
-              (endpoint_ip.u_addr.ip4.addr >> 0) & 0xff,
-              (endpoint_ip.u_addr.ip4.addr >> 8) & 0xff,
-              (endpoint_ip.u_addr.ip4.addr >> 16) & 0xff,
-              (endpoint_ip.u_addr.ip4.addr >> 24) & 0xff);
-        break;
+        success_get_endpoint_ip = false;
+
+        for (uint8_t retry = 0; retry < 5; retry++) {
+           ip_addr_t endpoint_ip = IPADDR4_INIT_BYTES(0, 0, 0, 0);
+           struct addrinfo* res = NULL;
+           struct addrinfo hint;
+           memset(&hint, 0, sizeof(hint));
+           memset(&endpoint_ip, 0, sizeof(endpoint_ip));
+
+           if (lwip_getaddrinfo(remotePeerAddress, NULL, &hint, &res) != 0) {
+               log_w(TAG "DNS lookup failed for '%s' (attempt %d/5), retrying in %u ms...",
+                     remotePeerAddress, retry + 1, retry_delay_ms);
+               vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
+               retry_delay_ms = (retry_delay_ms < 8000u) ? retry_delay_ms * 2u : 8000u;
+               continue;
+           }
+
+           success_get_endpoint_ip = true;
+           struct in_addr addr4 = ((struct sockaddr_in*)(res->ai_addr))->sin_addr;
+           inet_addr_to_ip4addr(ip_2_ip4(&endpoint_ip), &addr4);
+           lwip_freeaddrinfo(res);
+
+           peer.endpoint_ip = endpoint_ip;
+           log_i(TAG "%s is %3d.%3d.%3d.%3d", remotePeerAddress,
+                 (endpoint_ip.u_addr.ip4.addr >> 0) & 0xff,
+                 (endpoint_ip.u_addr.ip4.addr >> 8) & 0xff,
+                 (endpoint_ip.u_addr.ip4.addr >> 16) & 0xff,
+                 (endpoint_ip.u_addr.ip4.addr >> 24) & 0xff);
+           break;
+       }
+
+       if (!success_get_endpoint_ip)
+       {
+           log_e(TAG "failed to get endpoint ip.");
+           log_e(TAG "failed to resolve endpoint ip address '%s' after 5 attempts.", remotePeerAddress);
+           return false;
+       }
     }
 
-    if (!success_get_endpoint_ip) {
-        log_e(TAG "failed to resolve endpoint address '%s' after 5 attempts.", remotePeerAddress);
-        return false;
-    }
+    //FIXED print localIP,..in WireGuard::begin
+    log_d(TAG "=== BEFORE netif_add ===");
 
-    // Register the new WireGuard network interface with lwIP
+    log_d(TAG "localIP  = %s\n", localIP.toString().c_str());
+    log_d(TAG "Subnet   = %s\n", Subnet.toString().c_str());
+    log_d(TAG "Gateway  = %s\n", Gateway.toString().c_str());
+
+    log_d(TAG "ipaddr   = 0x%08lx\n",
+                (unsigned long)ipaddr.u_addr.ip4.addr);
+
+    log_d(TAG "netmask  = 0x%08lx\n",
+                (unsigned long)ipaddr.u_addr.ip4.addr);
+
+    // Register the new WireGuard network interface with lwIP.
     LOCK_TCPIP_CORE();
     _wg_netif = netif_add(&_wg_netif_struct, ip_2_ip4(&ipaddr), ip_2_ip4(&netmask), ip_2_ip4(&gateway), &wg, &wireguardif_init, &ip_input);
     if (_wg_netif == nullptr) {
@@ -98,11 +125,18 @@ bool WireGuard::begin(const IPAddress& localIP, const IPAddress& Subnet, const I
     peer.public_key = remotePeerPublicKey;
     peer.preshared_key = presharedKey;
 
-    // Allow all IPs through tunnel
-    {
+    if (allowedIP == IPAddress(0, 0, 0, 0)) {
+        // Allow all IPs through tunnel
         ip_addr_t allowed_ip = IPADDR4_INIT_BYTES(0, 0, 0, 0);
         peer.allowed_ip = allowed_ip;
         ip_addr_t allowed_mask = IPADDR4_INIT_BYTES(0, 0, 0, 0);
+        peer.allowed_mask = allowed_mask;
+    }
+    else {
+        // Split tunnel: only allowedIP's through WireGuard
+        ip_addr_t allowed_ip = IPADDR4_INIT(static_cast<uint32_t>(allowedIP));
+        peer.allowed_ip = allowed_ip;
+        ip_addr_t allowed_mask = IPADDR4_INIT(static_cast<uint32_t>(allowedMask));
         peer.allowed_mask = allowed_mask;
     }
 
@@ -117,10 +151,13 @@ bool WireGuard::begin(const IPAddress& localIP, const IPAddress& Subnet, const I
         // Start outbound connection to peer
         log_i(TAG "connecting wireguard...");
         wireguardif_connect(_wg_netif, _wireguard_peer_index);
-        // Save the current default interface for restoring when shutting down
-        _previous_default_netif = netif_default;
-        // Set default interface to WG device
-        netif_set_default(_wg_netif);
+
+        if (allowedIP == IPAddress(0, 0, 0, 0)) {
+            // Save the current default interface for restoring when shutting down
+	    _previous_default_netif = netif_default;
+            // Set default interface to WG device
+            netif_set_default(_wg_netif);
+        }
     }
     UNLOCK_TCPIP_CORE();
 
@@ -128,11 +165,17 @@ bool WireGuard::begin(const IPAddress& localIP, const IPAddress& Subnet, const I
     return true;
 }
 
-bool WireGuard::begin(const IPAddress& localIP, const char* privateKey, const char* remotePeerAddress, const char* remotePeerPublicKey, uint16_t remotePeerPort, uint16_t listenPort, const char* presharedKey) {
+
+bool WireGuard::begin(const IPAddress& localIP, const char* privateKey, const char* remotePeerAddress, const char* remotePeerPublicKey, uint16_t remotePeerPort, uint16_t listenPort, const char* presharedKey)
+{
     // Maintain compatibility with old begin
     auto subnet = IPAddress(255, 255, 255, 255);
     auto gateway = IPAddress(0, 0, 0, 0);
-    return WireGuard::begin(localIP, subnet, gateway, privateKey, remotePeerAddress, remotePeerPublicKey, remotePeerPort, listenPort, presharedKey);
+    auto allowed_ip = IPAddress(0, 0, 0, 0);
+    auto allowedMask = IPAddress(0, 0, 0, 0);
+    auto peerEndpointIP = IPAddress(0, 0, 0, 0);
+
+    return WireGuard::begin(localIP, subnet, gateway, privateKey, remotePeerAddress, remotePeerPublicKey, remotePeerPort, allowed_ip, allowedMask, peerEndpointIP, listenPort, presharedKey);
 }
 
 void WireGuard::end() {
